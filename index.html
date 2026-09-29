@@ -14,7 +14,7 @@
 </head>
 <body>
 <canvas id="screen" width="640" height="576" tabindex="0"></canvas>
-<div id="help">ARROWS move &middot; SPACE talk / select &middot; X/ESC back, or ask Nib &middot; ENTER menu &middot; brightness: title screen / menu OPTIONS</div>
+<div id="help">ARROWS move &middot; SPACE talk / select &middot; X/ESC back, or ask Nib &middot; ENTER menu (SAVE, OPTIONS: sound &amp; brightness)</div>
 <script>
 'use strict';
 /* =====================================================================
@@ -796,7 +796,8 @@ const LOOKS = {
 };
 
 // NPC fields: id, name, x, y, dir, look (human) | ghost | creature, lines (array or fn(Game) -> array),
-//   wander: {x0,x1,y0,y1} optional, trainer: TRAINERS id (stage 5), sleep: shows Zzz.
+//   wander: {x0,x1,y0,y1} optional, trainer: TRAINERS id, sleep: shows Zzz.
+//   Route trainers (stage 5, 15_trainers.js): sight = tiles they can see ahead, turns = directions they look around in.
 const MAPS = {
   overworld: {
     title: null, ambient: 0.52, outdoor: true,
@@ -842,11 +843,11 @@ const MAPS = {
       { id: 'mort', name: 'Old Mort', x: 14, y: 67, dir: 'left', look: 'mort', lines: [
         'Fish don\'t bite in Gloamhollow pond. They wave.', 'Polite little things.'] },
       // --- Whisperwood Trail ---
-      { id: 'pip', name: 'Forager Pip', x: 9, y: 39, dir: 'left', look: 'pip', trainer: 'forager_pip', lines: [
+      { id: 'pip', name: 'Forager Pip', x: 9, y: 39, dir: 'right', look: 'pip', trainer: 'forager_pip', sight: 3, turns: ['right', 'down'], lines: [
         'Glowcaps! Perfect for soup!', '...Just don\'t eat the ones that giggle. Trust me on that.'] },
       { id: 'wendel', name: 'Wendel the Ghost', x: 23, y: 47, dir: 'down', ghost: { body: '#e4ecff' }, lines: [
         'Oooooo! Have you seen my head?', '...Oh. Never mind, it\'s right here.', 'Being a ghost is great. I haven\'t stubbed a toe in two hundred years.'] },
-      { id: 'ott', name: 'Gravedigger Ott', x: 20, y: 33, dir: 'left', look: 'ott', trainer: 'gravedigger_ott', lines: [
+      { id: 'ott', name: 'Gravedigger Ott', x: 20, y: 33, dir: 'left', look: 'ott', trainer: 'gravedigger_ott', sight: 5, lines: [
         'The creek runs backwards on full moons. Don\'t ask how I know.',
         'East of the tall grass up north there\'s a wall of thorns that hums a lullaby.',
         'My granny said something with antlers sleeps behind it. Something BIG. Best let it snooze... for now.'] },
@@ -989,7 +990,9 @@ function zoneAt(map, x, y) {
 // Everything a save file needs lives in Game.state (plain JSON). Runtime-only data (sprites, scenes) lives elsewhere.
 function newGameState() {
   return {
-    version: 2,
+    version: 3,           // 3 = stage 5 (runId / savedAt); older saves load fine (SaveSystem.load fills the gaps)
+    runId: Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36),   // which journey this is (overwrite check)
+    savedAt: null,
     map: 'home', x: 6, y: 1, dir: 'down',
     party: [],            // [{species, level, xp, hp, stats, moves}] (see createCreature)
     storage: [],          // overflow creatures (stage 4)
@@ -1046,31 +1049,74 @@ const BRIGHTNESS = [
 const SETTINGS_KEY = 'gloamwood.settings.v1';   // key kept from before the rename to Hollowkin, so settings/saves carry over
 const Settings = {
   brightness: 1,
+  volume: 6, muted: false, ambient: true,   // sound (stage 5): volume 0-10, mute, quiet ambience loop per area
   load() {
     const s = SafeStorage.getJSON(SETTINGS_KEY);
-    if (s && Number.isInteger(s.brightness) && BRIGHTNESS[s.brightness]) this.brightness = s.brightness;
+    if (!s || typeof s !== 'object') return;
+    if (Number.isInteger(s.brightness) && BRIGHTNESS[s.brightness]) this.brightness = s.brightness;
+    if (Number.isInteger(s.volume) && s.volume >= 0 && s.volume <= 10) this.volume = s.volume;
+    if (typeof s.muted === 'boolean') this.muted = s.muted;
+    if (typeof s.ambient === 'boolean') this.ambient = s.ambient;
   },
-  save() { return SafeStorage.setJSON(SETTINGS_KEY, { brightness: this.brightness }); },
+  save() { return SafeStorage.setJSON(SETTINGS_KEY, { brightness: this.brightness, volume: this.volume, muted: this.muted, ambient: this.ambient }); },
+  setVolume(v) { this.volume = clamp(Math.round(v), 0, 10); if (this.volume > 0) this.muted = false; this.save(); Sound.applyVolume(); return this.volume; },
+  toggleMute() { this.muted = !this.muted; this.save(); Sound.applyVolume(); return this.muted; },
+  toggleAmbient() { this.ambient = !this.ambient; this.save(); Sound.applyVolume(); return this.ambient; },
   setBrightness(i) { this.brightness = ((i % BRIGHTNESS.length) + BRIGHTNESS.length) % BRIGHTNESS.length; this.save(); return this.brightnessName(); },
   cycleBrightness(d = 1) { return this.setBrightness(this.brightness + d); },
   brightnessName() { return BRIGHTNESS[this.brightness].name; },
 };
 
-const SAVE_KEY = 'gloamwood.save.v1';
-const SaveSystem = {   // Stage 5 wires this to the pause menu; kept tiny and JSON-only. All storage access is safe.
-  save() { Game.syncPlayerToState(); return SafeStorage.setJSON(SAVE_KEY, Game.state); },
-  hasSave() { return !!SafeStorage.get(SAVE_KEY); },
+const SAVE_KEY = 'gloamwood.save.v1';   // key kept from before the rename to Hollowkin, so old saves carry over
+// One save slot, plain JSON (Game.state). Pause -> SAVE writes it; the title screen's CONTINUE loads it.
+// All storage access goes through SafeStorage, so blocked/full storage just reports failure.
+const SaveSystem = {
+  save() {
+    if (!Game.state) return false;
+    Game.syncPlayerToState();
+    const prev = Game.state.savedAt;
+    Game.state.savedAt = Date.now();
+    const ok = SafeStorage.setJSON(SAVE_KEY, Game.state);
+    if (!ok) Game.state.savedAt = prev;
+    return ok;
+  },
+  read() {   // the stored save if it looks usable, else null
+    const d = SafeStorage.getJSON(SAVE_KEY);
+    return d && typeof d === 'object' && MAPS[d.map] && Number.isInteger(d.x) && Number.isInteger(d.y) && (!d.party || Array.isArray(d.party)) ? d : null;
+  },
+  hasSave() { return !!this.read(); },
+  // Short summary for the title screen / save prompt.
+  info(d = this.read()) {
+    if (!d) return null;
+    const m = MAPS[d.map], z = d.map === 'overworld' ? zoneAt(m, d.x, d.y) : null;
+    const party = (d.party || []).filter(c => c && SPECIES[c.species]);
+    return { where: z ? z.name : m.title || 'The Gloamwood', playTime: d.playTime || 0, party: party.map(c => ({ species: c.species, level: c.level })),
+      cleared: !!(d.flags && d.flags.gameCleared), savedAt: d.savedAt || null, runId: d.runId || 'legacy',
+      caught: Object.keys(d.caught || {}).length, lore: Object.keys(d.lore || {}).length };
+  },
   load() {
-    const data = SafeStorage.getJSON(SAVE_KEY);
-    if (!data || typeof data !== 'object' || !MAPS[data.map]) return false;
-    Game.state = Object.assign(newGameState(), data);
-    Game.state.settings = Object.assign({ markers: true }, data.settings || {});
-    Game.enterMap(Game.state.map, Game.state.x, Game.state.y, Game.state.dir);
+    const data = this.read();
+    if (!data) return false;
+    const st = Object.assign(newGameState(), data);
+    st.bag = Object.assign(newGameState().bag, data.bag || {});
+    st.settings = Object.assign({ markers: true }, data.settings || {});
+    for (const k of ['flags', 'seen', 'caught', 'defeatedTrainers', 'quests', 'lore', 'hints']) st[k] = data[k] && typeof data[k] === 'object' && !Array.isArray(data[k]) ? data[k] : {};
+    for (const k of ['party', 'storage']) st[k] = Array.isArray(data[k]) ? data[k].filter(c => c && SPECIES[c.species]) : [];
+    if (!MAPS[(st.lastHeal || {}).map]) st.lastHeal = newGameState().lastHeal;
+    st.runId = data.runId || 'legacy';
+    st.version = 3;
+    Game.state = st;
+    Game.enterMap(st.map, st.x, st.y, st.dir || 'down');
     Quests.refresh(Game, { silent: true });   // rebuild quest status from flags; no duplicate rewards or toasts
     return true;
   },
   clear() { return SafeStorage.remove(SAVE_KEY); },
 };
+function fmtTime(sec) {
+  sec = Math.floor(sec || 0);
+  const h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = sec % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${m}:${String(s).padStart(2, '0')}`;
+}
 
 // ===================== INPUT =====================
 const KEYMAP = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', ' ': 'a', z: 'a', Z: 'a',
@@ -1124,13 +1170,29 @@ function drawBox(g, x, y, w, h) {
 // Stage 3 added BattleScene (08_battle.js); stage 4 adds PauseMenuScene / StarterScene, stage 5 VictoryScene.
 const GAME_TITLE = 'HOLLOWKIN';   // the game's name (renamed from the working title Gloamwood; the forest is still the Gloamwood)
 class TitleScene {
-  constructor() { this.opaque = true; this.t = 0; }
+  // No save: ENTER starts a new game (as before). With a save: CONTINUE / NEW GAME (NEW GAME asks first).
+  constructor() { this.opaque = true; this.t = 0; this.cursor = 0; this.confirm = null; this.info = SaveSystem.info(); }
   update(dt) { this.t += dt; }
   onPress(k) {
-    if (k === 'start' || k === 'a') { Game.scenes.pop(); Game.startNewGame(); }
+    if (this.confirm) {   // "Start a new journey?"  YES / NO (NO is the default)
+      if (k === 'up' || k === 'down' || k === 'left' || k === 'right') this.confirm.yes ^= 1;
+      else if (k === 'b' || ((k === 'a' || k === 'start') && !this.confirm.yes)) this.confirm = null;
+      else if (k === 'a' || k === 'start') { this.confirm = null; this.newGame(); }
+      return;
+    }
+    this.info = SaveSystem.info();
+    if (!this.info) this.cursor = 0;
+    if (k === 'start' || k === 'a') {
+      if (!this.info) this.newGame();
+      else if (this.cursor === 0) this.continueGame();
+      else this.confirm = { yes: 0 };
+    }
+    else if ((k === 'up' || k === 'down') && this.info) this.cursor ^= 1;
     else if (k === 'left') Settings.cycleBrightness(-1);
     else if (k === 'right' || k === 'b') Settings.cycleBrightness(1);   // brightness also lives in Pause -> OPTIONS
   }
+  newGame() { Game.popScene(this); Game.startNewGame(); }
+  continueGame() { Game.popScene(this); Game.continueGame(); }
   draw(g) {
     g.fillStyle = '#07050f'; g.fillRect(0, 0, 640, 576);
     for (let i = 0; i < 40; i++) {   // drifting wisps
@@ -1140,20 +1202,43 @@ class TitleScene {
     }
     g.textAlign = 'center';
     g.font = 'bold 64px "DejaVu Sans Mono", monospace';
-    g.fillStyle = '#2a1a4a'; g.fillText(GAME_TITLE, 324, 176);
-    g.fillStyle = '#d8c8ff'; g.fillText(GAME_TITLE, 320, 170);
-    g.font = FONT; g.fillStyle = PAL.textDim; g.fillText('Lanterns & Lost Things', 320, 214);
+    g.fillStyle = '#2a1a4a'; g.fillText(GAME_TITLE, 324, 146);
+    g.fillStyle = '#d8c8ff'; g.fillText(GAME_TITLE, 320, 140);
+    g.font = FONT; g.fillStyle = PAL.textDim; g.fillText('Lanterns & Lost Things', 320, 184);
     g.imageSmoothingEnabled = false;
     ['flickit', 'sporrel', 'rattlepup'].forEach((id, i) => {
       const bob = Math.round(Math.sin(this.t * 3 + i) * 4);
-      g.drawImage(CREATURE_SPRITES[id], 176 + i * 112, 270 + bob, 64, 64);
+      g.drawImage(CREATURE_SPRITES[id], 176 + i * 112, 222 + bob, 64, 64);
     });
-    if (Math.floor(this.t * 2) % 2 === 0) { g.fillStyle = PAL.text; g.fillText('PRESS ENTER', 320, 420); }
-    g.fillStyle = PAL.flame; g.fillText(`\u25c0 Brightness: ${Settings.brightnessName()} \u25b6`, 320, 470);
+    const info = this.info;
+    if (!info) {
+      if (Math.floor(this.t * 2) % 2 === 0) { g.fillStyle = PAL.text; g.fillText('PRESS ENTER', 320, 380); }
+    } else {
+      ['CONTINUE', 'NEW GAME'].forEach((t, i) => {
+        const y = i === 0 ? 352 : 428, sel = i === this.cursor;
+        g.font = FONT; g.fillStyle = sel ? PAL.flame2 : PAL.text; g.fillText(t, 320, y);
+        if (sel) { g.textAlign = 'right'; g.fillText('\u25b6', 250, y); g.textAlign = 'center'; }
+      });
+      g.font = MFONT_XS; g.fillStyle = PAL.textDim;
+      const lead = info.party[0], more = info.party.length - 1;
+      g.fillText(`${info.cleared ? '\u2605 ' : ''}${info.where} \u00b7 ${fmtTime(info.playTime)}${lead ? ` \u00b7 ${SPECIES[lead.species].name} Lv${lead.level}${more > 0 ? ` +${more}` : ''}` : ''}`, 320, 380);
+      g.fillText(`Creatures caught ${info.caught} \u00b7 Lore pages ${info.lore}`, 320, 400);
+    }
+    g.font = FONT; g.fillStyle = PAL.flame; g.fillText(`\u25c0 Brightness: ${Settings.brightnessName()} \u25b6`, 320, 482);
     g.fillStyle = '#5a4e7a'; g.font = 'bold 16px "DejaVu Sans Mono", monospace';
-    g.fillText('Arrows: move    Space: talk / next', 320, 520);
-    g.fillText('Enter: menu   X / Esc / B: back, or ask Nib', 320, 544);
+    g.fillText('Arrows: move    Space: talk / next', 320, 522);
+    g.fillText('Enter: menu   X / Esc / B: back, or ask Nib', 320, 546);
     g.textAlign = 'left';
+    if (this.confirm) {
+      drawBox(g, 80, 300, 480, 170);
+      g.font = FONT; g.fillStyle = PAL.flame; g.fillText('Start a NEW journey?', 112, 344);
+      g.font = MFONT_XS; g.fillStyle = PAL.textDim;
+      g.fillText('Your old save stays until you save over it.', 112, 372);
+      ['YES', 'NO'].forEach((t, i) => {
+        const x = 200 + i * 160, sel = (i === 0) === !!this.confirm.yes;
+        g.font = FONT; g.fillStyle = sel ? PAL.flame2 : PAL.text; g.fillText(t, x, 426); if (sel) g.fillText('\u25b6', x - 28, 426);
+      });
+    }
   }
 }
 
@@ -1223,14 +1308,38 @@ class FadeScene {
 
 class EncounterFlashScene {
   // Classic flicker + wipe before a battle; calls then() when finished.
-  constructor(then) { this.opaque = false; this.t = 0; this.then = then; }
-  update(dt) { this.t += dt; if (this.t >= 0.7) { Game.popScene(this); this.then(); } }
+  // style: 'wild' (flicker, then shutters close), 'trainer' (flicker, then a spiral of squares), 'boss' (slow blinds).
+  constructor(then, style = 'wild') {
+    this.opaque = false; this.t = 0; this.then = then; this.style = style; this.d = style === 'boss' ? 1.1 : style === 'trainer' ? 0.9 : 0.7;
+    Sound.play(style === 'wild' ? 'battleStart' : 'trainerBattle');
+  }
+  update(dt) { this.t += dt; if (this.t >= this.d) { Game.popScene(this); this.then(); } }
   onPress() {}
   draw(g) {
-    const phase = Math.floor(this.t * 14) % 2;
-    if (this.t < 0.5) { g.fillStyle = phase ? 'rgba(240,236,255,0.75)' : 'rgba(0,0,0,0.6)'; g.fillRect(0, 0, 640, 576); }
-    else { const k = Math.min(1, (this.t - 0.5) / 0.2); g.fillStyle = '#000'; g.fillRect(0, 0, 640, 288 * k); g.fillRect(0, 576 - 288 * k, 640, 288 * k); }
+    const flashEnd = this.style === 'wild' ? 0.5 : 0.4, phase = Math.floor(this.t * 14) % 2;
+    if (this.t < flashEnd) { g.fillStyle = phase ? 'rgba(240,236,255,0.75)' : 'rgba(0,0,0,0.6)'; g.fillRect(0, 0, 640, 576); return; }
+    const k = Math.min(1, (this.t - flashEnd) / (this.d - flashEnd - 0.05));
+    g.fillStyle = '#000';
+    if (this.style === 'wild') { g.fillRect(0, 0, 640, 288 * k); g.fillRect(0, 576 - 288 * k, 640, 288 * k); }
+    else if (this.style === 'trainer') {   // 8x8 grid of squares, filled in a spiral from the outside in
+      const order = EncounterFlashScene.spiral || (EncounterFlashScene.spiral = spiralOrder(8, 8));
+      const n = Math.ceil(order.length * k);
+      for (let i = 0; i < n; i++) { const [cx, cy] = order[i]; g.fillRect(cx * 80, cy * 72, 80, 72); }
+    } else {   // boss: venetian blinds closing
+      for (let i = 0; i < 12; i++) g.fillRect(0, i * 48, 640, Math.ceil(48 * k));
+    }
   }
+}
+function spiralOrder(w, h) {
+  const out = []; let x0 = 0, y0 = 0, x1 = w - 1, y1 = h - 1;
+  while (x0 <= x1 && y0 <= y1) {
+    for (let x = x0; x <= x1; x++) out.push([x, y0]);
+    for (let y = y0 + 1; y <= y1; y++) out.push([x1, y]);
+    if (y1 > y0) for (let x = x1 - 1; x >= x0; x--) out.push([x, y1]);
+    if (x1 > x0) for (let y = y1 - 1; y > y0; y--) out.push([x0, y]);
+    x0++; y0++; x1--; y1--;
+  }
+  return out;
 }
 
 class OverworldScene {
@@ -1246,9 +1355,13 @@ class OverworldScene {
     const p = Game.player;
     Game.state.playTime += dt;
     this.bannerT += dt;
-    if (this.bannerT >= 2.4 && Game.toasts.length) this.showBanner(Game.toasts.shift());
+    if (this.bannerT >= 2.4 && Game.toasts.length) {
+      const t = Game.toasts.shift(); this.showBanner(t);
+      Sound.play(/QUEST/.test(t) ? 'quest' : /^Got |LORE/.test(t) ? 'item' : 'text');
+    }
     if (Game.top() === this && !Game.player.moving && Game.idleQueue.length) { Game.idleQueue.shift()(); return; }
     updateNPCs(dt);
+    if (!p.moving && Game.top() === this && Trainers.update(dt)) return;   // a turning trainer just spotted you
     if (p.moving) {
       p.moveT += dt / WALK_TIME;
       if (p.moveT >= 1) {
@@ -1267,7 +1380,7 @@ class OverworldScene {
     p.dir = dir;
     const nx = p.x + DIRS[dir][0], ny = p.y + DIRS[dir][1];
     const door = map.doors[`${nx},${ny}`];
-    if (door && door.to) { Game.warp(door.to, door.tx, door.ty, door.dir); return; }
+    if (door && door.to) { Sound.play('door'); Game.warp(door.to, door.tx, door.ty, door.dir); return; }
     if (Game.isWalkable(map, nx, ny)) {
       p.moving = true; p.moveT = 0; p.tx = nx; p.ty = ny;
       Game.state.steps++;
@@ -1278,8 +1391,10 @@ class OverworldScene {
   }
   onStepComplete() {
     const p = Game.player, map = Game.map, ch = tileAt(map, p.x, p.y);
-    if (ch === 'e' && map.exit) { Game.warp(map.exit.to, map.exit.tx, map.exit.ty, map.exit.dir); return; }
+    if (ch === 'e' && map.exit) { Sound.play('door'); Game.warp(map.exit.to, map.exit.tx, map.exit.ty, map.exit.dir); return; }
+    Sound.play(TILE_INFO[ch].encounter ? 'grass' : 'step');
     this.checkZone();
+    if (Trainers.check(Game)) return;   // route trainers challenge on line of sight (15_trainers.js) before any wild encounter
     if (TILE_INFO[ch].encounter) {
       const z = zoneAt(map, p.x, p.y);
       if (z && z.table && Game.encountersEnabled && Game.rng() < ENCOUNTER_RATE) {
@@ -1475,7 +1590,8 @@ function renderWorld(g) {
   lights.push({ x: pp.px + 8, y: pp.py + 6, r: (map.outdoor ? 46 : 60) * bright.light, c: '255,200,140', seed: 0, player: true });
   darkCtx.globalCompositeOperation = 'source-over';
   darkCtx.clearRect(0, 0, SCREEN_W, SCREEN_H);
-  darkCtx.fillStyle = `rgba(6,3,20,${(map.ambient * bright.ambient).toFixed(3)})`;   // brightness setting scales the night darkCtx.fillRect(0, 0, SCREEN_W, SCREEN_H);
+  darkCtx.fillStyle = `rgba(6,3,20,${(map.ambient * bright.ambient).toFixed(3)})`;   // brightness setting scales the night
+  darkCtx.fillRect(0, 0, SCREEN_W, SCREEN_H);   // (stage 5 fix: this fill had been swallowed by the comment above since stage 3)
   darkCtx.globalCompositeOperation = 'destination-out';
   for (const L of lights) {
     const r = L.r * (1 + 0.06 * Math.sin(t * 5 + L.seed)), x = L.x - cam.x, y = L.y - cam.y;
@@ -1526,7 +1642,7 @@ const Game = {
   top() { return this.scenes[this.scenes.length - 1]; },
   pushScene(s) { this.scenes.push(s); return s; },
   popScene(s) { const i = this.scenes.lastIndexOf(s); if (i >= 0) this.scenes.splice(i, 1); },
-  press(k) { const s = this.top(); if (s && s.onPress) s.onPress(k); },
+  press(k) { const s = this.top(); if (s && s.onPress) { soundForKey(k, s); s.onPress(k); } },   // menu blips: 14_audio.js
   say(pages, opts) { return this.pushScene(new DialogScene(pages, opts)); },
 
   startNewGame() {
@@ -1536,6 +1652,17 @@ const Game = {
     this.idleQueue = []; this.toasts = [];
     this.enterMap(this.state.map, this.state.x, this.state.y, this.state.dir);
     Quests.refresh(this);   // starts MQ1 "A Keeper's Morning"
+  },
+  // Title -> CONTINUE: load the save slot (falls back to a new game if it can't be read).
+  continueGame() {
+    this.overworld = new OverworldScene();
+    this.scenes = [this.overworld];
+    this.idleQueue = []; this.toasts = [];
+    if (!SaveSystem.load()) { this.startNewGame(); return false; }
+    this.toast('Welcome back!');
+    // A save that finished the story before stage 5 existed never saw the credits: show them once now.
+    if (Quests.isDone('mq6_last_watch') && !this.state.flags.gameCleared) this.whenIdle(() => Ending.show());
+    return true;
   },
   enterMap(mapId, x, y, dir) {
     this.map = MAPS[mapId];
@@ -1604,6 +1731,7 @@ const Game = {
       const st = Game.state;
       for (const c of st.party) c.hp = c.stats.hp;
       const id = Game.map && Game.map.id;
+      Sound.play('heal');
       if (id === 'gloam_lantern' || id === 'mire_lantern') {
         st.lastHeal = { map: id, x: 4, y: 3 };
         delete st.flags.vesperglowAsleep; delete st.flags.ossuarchResting;
@@ -1616,7 +1744,7 @@ const Game = {
       return c;
     },
     openPauseMenu() { Game.pushScene(new PauseMenuScene()); },
-    onBump(x, y) { /* STAGE 5: bump sound effect */ },
+    onBump(x, y) { Sound.play('bump'); },
   },
 };
 
@@ -1627,6 +1755,7 @@ function frame(ts) {
   try {
     Game.time += dt;
     const top = Game.top(); if (top) top.update(dt);
+    Sound.update(dt);   // ambience per area (14_audio.js)
     let start = Game.scenes.length - 1;
     while (start > 0 && !Game.scenes[start].opaque) start--;
     for (let i = Math.max(0, start); i < Game.scenes.length; i++) Game.scenes[i].draw(Game.ctx);
@@ -1638,6 +1767,7 @@ function boot() {
   Game.ctx = Game.canvas.getContext('2d'); Game.ctx.imageSmoothingEnabled = false;
   Game.low = mkCanvas(SCREEN_W, SCREEN_H); Game.lctx = Game.low.getContext('2d');
   Settings.load();
+  Sound.init();   // audio starts on the first key press / tap (autoplay rules)
   buildCreatureSprites(); buildMaps(); buildFog(); buildBattleArt();
   Game.playerFrames = buildHumanFrames(LOOKS.player);
   Input.init();
@@ -1818,7 +1948,8 @@ function findTrainerNpc(trainerId) {
 }
 function startBattle(opts) {
   for (const f of opts.foes) Game.state.seen[f.species] = true;
-  Game.pushScene(new EncounterFlashScene(() => Game.pushScene(new BattleScene(opts))));
+  const style = opts.kind === 'trainer' ? (opts.trainer && opts.trainer.boss ? 'boss' : 'trainer') : 'wild';
+  Game.pushScene(new EncounterFlashScene(() => Game.pushScene(new BattleScene(opts)), style));
   return true;
 }
 function doBlackout(fade) {   // all creatures fainted: wake up at the last Lantern House (Gloamhollow until stage 4), healed
@@ -1935,6 +2066,7 @@ class BattleScene {
     }
   }
   begin(it) {
+    if (it.sfx) Sound.play(it.sfx);   // optional sound on any queue item (14_audio.js)
     if (it.fn) { const more = it.fn() || []; this.queue.unshift(...more); }
     else if (it.say !== undefined) this.setCaption(it.say);
     else if (it.msg !== undefined) { this.setCaption(it.msg); this.cur = it; }
@@ -1958,6 +2090,9 @@ class BattleScene {
       case 'trainerIn': this.trainerFx.visible = true; this.fx.foe.box = false; break;
       case 'throw': this.ball = { id: it.ball, x: 40, y: 70, dx: 0, visible: true }; break;
     }
+    const sfx = { hit: it.mult > 1 ? 'hitSuper' : it.mult < 1 ? 'hitWeak' : 'hit', faint: 'faint', throw: 'throw', wobble: 'wobble',
+      click: 'catch', breakout: 'breakout', statUp: 'statUp', statDown: 'statDown' }[it.anim];
+    if (sfx) Sound.play(sfx);
     it.dur = it.dur || ANIM_DUR[it.anim] || 0.3;
     this.animStep(it, 0);
   }
@@ -2033,7 +2168,7 @@ class BattleScene {
       if (Game.debug.ohko && side === 'player') dmg = def.hp;          // test helper: speed up scripted playthroughs
       if (Game.debug.god && side === 'foe') dmg = 0;
       const dealt = Math.max(0, Math.min(dmg, def.hp)); def.hp -= dealt;
-      items.push({ anim: 'hit', side: other }, { anim: 'hp', side: other, to: def.hp });
+      items.push({ anim: 'hit', side: other, mult }, { anim: 'hp', side: other, to: def.hp });
       if (mult > 1) items.push({ msg: "It's super effective!" });
       else if (mult < 1) items.push({ msg: "It's not very effective..." });
       else items.push({ wait: 0.35 });
@@ -2106,7 +2241,7 @@ class BattleScene {
     if (c.hp > 0) c.hp = Math.min(c.stats.hp, c.hp + (c.stats.hp - old.hp));   // HP rises by as much as max HP did
     if (i === this.pi) { this.shownXp = c.xp; this.shownHp.player = c.hp; }
     const gains = {}; for (const k of Object.keys(c.stats)) gains[k] = c.stats[k] - old[k];
-    const items = [{ msg: `${name} grew to Lv ${c.level}!`, statBox: { stats: Object.assign({}, c.stats), gains } }];
+    const items = [{ msg: `${name} grew to Lv ${c.level}!`, statBox: { stats: Object.assign({}, c.stats), gains }, sfx: 'levelUp' }];
     for (const m of movesLearnedAt(c.species, c.level)) items.push(...this.learnItems(c, m));
     return items;
   }
@@ -2144,7 +2279,9 @@ class BattleScene {
     if (this.kind === 'trainer') {
       const T = this.trainer, st = Game.state;
       st.defeatedTrainers[T.id] = true; st.coins += T.reward;
-      const items = [{ anim: 'trainerIn' }, { msg: `You defeated ${T.name}!` }];
+      const items = [{ anim: 'trainerIn' }, { msg: `You defeated ${T.name}!`, sfx: 'win' }];
+      const lose = typeof TRAINER_TALK !== 'undefined' && TRAINER_TALK[T.id] && TRAINER_TALK[T.id].lose;   // route trainers (15_trainers.js)
+      if (lose) items.push({ msg: `${T.name}: ${lose}` });
       if (T.reward) items.push({ msg: `${T.name} handed over ${T.reward} coins.` });
       items.push({ fn: () => this.finish('win') });
       return items;
@@ -2183,7 +2320,7 @@ class BattleScene {
   tryRun() {
     if (this.kind === 'trainer') { this.run([{ msg: "No! There's no running from a trainer battle!" }, { fn: () => this.startTurn() }]); return; }
     const pS = effStat(this.pmon.stats.spd, this.stages.player.spd), fS = effStat(this.foe.stats.spd, this.stages.foe.spd);
-    if (Game.rng() < escapeChance(pS, fS, this.failedRuns)) { this.run([{ msg: 'Got away safely!' }, { fn: () => this.finish('run') }]); return; }
+    if (Game.rng() < escapeChance(pS, fS, this.failedRuns)) { this.run([{ msg: 'Got away safely!', sfx: 'run' }, { fn: () => this.finish('run') }]); return; }
     this.failedRuns++;
     this.run([{ msg: "Couldn't get away!" }, { fn: () => this.act('foe', this.pickFoeMove(), this.foe) }, { fn: () => this.startTurn() }]);
   }
@@ -3411,6 +3548,8 @@ const Quests = {
           if (!silent) G.toast('QUEST COMPLETE!');
           this.grant(q.reward || {}, { silent });
           if (st.tracked === id) st.tracked = null;
+          // The main story ends with MQ6: victory / credits screen once the reward XP is handed out (16_ending.js).
+          if (id === 'mq6_last_watch' && !silent && !st.flags.gameCleared) G.whenIdle(() => Ending.show());
         }
       }
     }
@@ -3609,6 +3748,7 @@ function drawQuestOverlay(g, cam) {
 
 // ===================== MENUS (stage 4) =====================
 // StarterScene, pause menu (PARTY / BAG / LOG / JOURNAL / ASK NIB / OPTIONS / SAVE), storage, shop, options.
+// (SAVE opens SaveScene and OPTIONS has the sound settings since stage 5: see 14_audio.js / 16_ending.js.)
 // All drawn natively at 4x on the 640x576 canvas, in the same boxes and fonts as dialogs and battles.
 const MFONT_S = 'bold 18px "DejaVu Sans Mono", "Courier New", monospace';
 const MFONT_XS = 'bold 15px "DejaVu Sans Mono", "Courier New", monospace';
@@ -3704,7 +3844,7 @@ class PauseMenuScene {
     else if (item === 'JOURNAL') Game.pushScene(new JournalScene());
     else if (item === 'ASK NIB') { Game.popScene(this); askNib(); }
     else if (item === 'OPTIONS') Game.pushScene(new OptionsScene());
-    else if (item === 'SAVE') Game.say(['Saving your journey arrives in the next update. (Your quest progress is already kept in the save data.)']);
+    else if (item === 'SAVE') Game.pushScene(new SaveScene());   // 16_ending.js
     else Game.popScene(this);
   }
   draw(g) {
@@ -3992,22 +4132,36 @@ class JournalScene {
   }
 }
 
-// ---------------- options (brightness moved here from the map's B key) ----------------
+// ---------------- options: brightness, quest markers, sound (stage 5) ----------------
+// Row order is kept stable (brightness 0, markers 1) so older tests / muscle memory still work.
+const OPTION_ROWS = ['brightness', 'markers', 'sound', 'volume', 'ambient', 'back'];
 class OptionsScene {
   constructor() { this.opaque = false; this.cursor = 0; }
   update() {}
   onPress(k) {
-    const st = Game.state;
-    if (k === 'up' || k === 'down') this.cursor = moveCursor(this.cursor, 3, k);
+    const st = Game.state, row = OPTION_ROWS[this.cursor], change = k === 'left' || k === 'right' || k === 'a';
+    if (k === 'up' || k === 'down') this.cursor = moveCursor(this.cursor, OPTION_ROWS.length, k);
     else if (k === 'b') Game.popScene(this);
-    else if (this.cursor === 0 && (k === 'left' || k === 'right' || k === 'a')) Settings.cycleBrightness(k === 'left' ? -1 : 1);
-    else if (this.cursor === 1 && (k === 'left' || k === 'right' || k === 'a')) st.settings.markers = st.settings.markers === false;
-    else if (this.cursor === 2 && k === 'a') Game.popScene(this);
+    else if (row === 'brightness' && change) Settings.cycleBrightness(k === 'left' ? -1 : 1);
+    else if (row === 'markers' && change) st.settings.markers = st.settings.markers === false;
+    else if (row === 'sound' && change) { Settings.toggleMute(); if (!Settings.muted) Sound.play('select'); }
+    else if (row === 'volume' && change) { Settings.setVolume(Settings.volume + (k === 'left' ? -1 : 1)); Sound.play('cursor'); }
+    else if (row === 'volume' && k === 'a') Sound.play('select');
+    else if (row === 'ambient' && change) Settings.toggleAmbient();
+    else if (row === 'back' && k === 'a') Game.popScene(this);
   }
   draw(g) {
-    drawBox(g, 64, 160, 512, 220); menuTitle(g, 'OPTIONS', 96, 210);
-    const rows = [`Brightness: \u25c0 ${Settings.brightnessName()} \u25b6`, `Quest markers: ${Game.state.settings.markers === false ? 'OFF' : 'ON'}`, 'BACK'];
-    rows.forEach((t, i) => { const y = 258 + i * 40; g.font = FONT; g.fillStyle = i === this.cursor ? PAL.flame2 : PAL.text; g.fillText(t, 128, y); if (i === this.cursor) cursorAt(g, 96, y); });
+    drawBox(g, 64, 100, 512, 368); menuTitle(g, 'OPTIONS', 96, 150);
+    const bars = '\u25a0'.repeat(Settings.volume) + '\u25a1'.repeat(10 - Settings.volume);
+    const rows = [`Brightness: \u25c0 ${Settings.brightnessName()} \u25b6`, `Quest markers: ${Game.state.settings.markers === false ? 'OFF' : 'ON'}`,
+      `Sound: ${Settings.muted ? 'OFF' : 'ON'}`, `Volume: \u25c0 ${bars} \u25b6`, `Ambience: ${Settings.ambient ? 'ON' : 'OFF'}`, 'BACK'];
+    rows.forEach((t, i) => {
+      const y = 198 + i * 40, dim = (i === 3 || i === 4) && Settings.muted;
+      g.font = FONT; g.fillStyle = i === this.cursor ? PAL.flame2 : dim ? PAL.textDim : PAL.text; g.fillText(t, 128, y);
+      if (i === this.cursor) cursorAt(g, 96, y);
+    });
+    g.font = MFONT_XS; g.fillStyle = PAL.textDim;
+    g.fillText(Sound.available ? (Sound.started ? 'Sound is made live in code. Settings are remembered.' : 'Sound starts after your first key press or tap.') : 'Sound isn\'t available in this browser.', 96, 444);
   }
 }
 
@@ -4195,6 +4349,482 @@ Object.assign(window.GAME, {
     for (const [name, team] of Object.entries(teams)) { let w = 0; for (let i = 0; i < n; i++) if (simBattle(team, 'lady_ashgrave')) w++; out[name] = w / n; }
     return out;
   },
+});
+
+// ===================== SOUND (stage 5) =====================
+// Every sound is synthesised with the Web Audio API: no audio files.
+// Browser autoplay rules: the AudioContext is only created (or resumed) inside a real user gesture
+// (key press, tap, click). If Web Audio is missing or blocked, every call quietly does nothing.
+// Settings (volume 0-10, mute, ambience) live in Settings and are remembered via SafeStorage.
+const SFX_NAMES = ['step', 'grass', 'bump', 'cursor', 'select', 'back', 'text', 'open', 'door', 'hit', 'hitSuper', 'hitWeak',
+  'faint', 'throw', 'wobble', 'catch', 'breakout', 'levelUp', 'quest', 'item', 'spot', 'battleStart', 'trainerBattle',
+  'win', 'heal', 'save', 'run', 'statUp', 'statDown', 'victory', 'error'];
+const Sound = {
+  ctx: null, master: null, sfxBus: null, ambBus: null, noiseBuf: null,
+  available: false, started: false, errors: 0, requested: 0, played: 0, last: null,
+  mood: null, amb: null, evT: 3, lastBump: 0, lastStep: 0,
+  init() {
+    try { this.available = !!(window.AudioContext || window.webkitAudioContext); } catch (e) { this.available = false; }
+    const unlock = () => this.unlock();
+    for (const ev of ['keydown', 'pointerdown', 'touchstart', 'mousedown']) {
+      try { window.addEventListener(ev, unlock, true); } catch (e) { /* ignore */ }
+    }
+  },
+  // Called from user-gesture handlers only.
+  unlock() {
+    if (!this.available) return false;
+    if (!this.ctx) {
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        const ctx = new AC();
+        this.master = ctx.createGain(); this.master.gain.value = 0; this.master.connect(ctx.destination);
+        this.sfxBus = ctx.createGain(); this.sfxBus.gain.value = 1; this.sfxBus.connect(this.master);
+        this.ambBus = ctx.createGain(); this.ambBus.gain.value = 0; this.ambBus.connect(this.master);
+        const len = Math.floor(ctx.sampleRate * 2), buf = ctx.createBuffer(1, len, ctx.sampleRate), d = buf.getChannelData(0);
+        let seed = 12345;
+        for (let i = 0; i < len; i++) { seed = (seed * 1103515245 + 12345) & 0x7fffffff; d[i] = seed / 0x3fffffff - 1; }
+        this.noiseBuf = buf; this.ctx = ctx; this.started = true;
+        this.applyVolume();
+      } catch (e) { this.errors++; this.available = false; this.ctx = null; return false; }
+    }
+    try {
+      if (this.ctx.state === 'suspended') { const p = this.ctx.resume(); if (p && p.catch) p.catch(() => {}); }
+    } catch (e) { this.errors++; }
+    return true;
+  },
+  volumeGain() { return Settings.muted ? 0 : Math.pow(Settings.volume / 10, 1.6) * 0.8; },
+  applyVolume() {
+    if (!this.ctx) return;
+    try {
+      const t = this.ctx.currentTime;
+      this.master.gain.cancelScheduledValues(t); this.master.gain.setTargetAtTime(this.volumeGain(), t, 0.03);
+      this.ambBus.gain.cancelScheduledValues(t); this.ambBus.gain.setTargetAtTime(Settings.ambient ? 1 : 0, t, 0.3);
+    } catch (e) { this.errors++; }
+  },
+  // Play a named effect. Returns true if a sound was actually scheduled.
+  play(name) {
+    this.requested++; this.last = name;
+    if (!this.ctx || Settings.muted || Settings.volume <= 0) return false;
+    const fn = SFX[name]; if (!fn) return false;
+    try {
+      if (this.ctx.state !== 'running') return false;
+      fn(this, this.ctx.currentTime + 0.005); this.played++; return true;
+    } catch (e) { this.errors++; return false; }
+  },
+  // ---- tiny synth helpers ----
+  tone(t, freq, dur, o = {}) {
+    const c = this.ctx, osc = c.createOscillator(), g = c.createGain();
+    osc.type = o.type || 'square'; osc.frequency.setValueAtTime(freq, t);
+    if (o.to) osc.frequency.exponentialRampToValueAtTime(Math.max(20, o.to), t + dur);
+    const v = o.vol ?? 0.08, a = o.attack ?? 0.005;
+    g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(v, t + a);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(g); g.connect(o.bus || this.sfxBus);
+    osc.start(t); osc.stop(t + dur + 0.02);
+  },
+  noise(t, dur, o = {}) {
+    const c = this.ctx, src = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain();
+    src.buffer = this.noiseBuf; src.loop = true;
+    f.type = o.filter || 'lowpass'; f.frequency.setValueAtTime(o.freq || 1200, t); f.Q.value = o.q || 0.7;
+    if (o.to) f.frequency.exponentialRampToValueAtTime(o.to, t + dur);
+    const v = o.vol ?? 0.1;
+    g.gain.setValueAtTime(0.0001, t); g.gain.linearRampToValueAtTime(v, t + (o.attack ?? 0.004));
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(f); f.connect(g); g.connect(o.bus || this.sfxBus);
+    src.start(t, Math.random() * 1.5); src.stop(t + dur + 0.02);
+  },
+  arp(t, notes, step, o = {}) { notes.forEach((n, i) => this.tone(t + i * step, n, o.dur || step * 1.6, o)); },
+
+  // ---- ambience: a quiet loop per area (wind, drones, owls, crickets, drips, crackles) ----
+  moodNow() {
+    const top = Game.top();
+    if (!top || top instanceof TitleScene || (typeof VictoryScene !== 'undefined' && top instanceof VictoryScene)) return 'title';
+    if (!Game.map || !Game.state) return 'title';
+    const id = Game.map.id;
+    if (id === 'manor') return 'manor';
+    if (id !== 'overworld') return 'indoor';
+    const z = Game.player && zoneAt(Game.map, Game.player.x, Game.player.y);
+    const name = z ? z.name : '';
+    return name === 'Moonlit Barrow' ? 'barrow' : name === 'Whisperwood Trail' ? 'forest' : 'village';
+  },
+  update(dt) {
+    if (!this.ctx) return;
+    try {
+      const inBattle = !!battleScene() && battleScene().kind !== 'xp';
+      const mood = this.moodNow();
+      if (mood !== this.mood) this.setMood(mood);
+      if (this.amb) {   // duck the ambience during battles
+        const want = inBattle ? 0.25 : 1;
+        if (this.amb.duck !== want) { this.amb.duck = want; this.amb.gain.gain.setTargetAtTime(this.amb.level * want, this.ctx.currentTime, 0.4); }
+      }
+      if (!Settings.ambient || Settings.muted || this.ctx.state !== 'running') return;
+      this.evT -= dt;
+      if (this.evT <= 0) { const M = AMBIENCE[this.mood]; this.evT = M ? M.every[0] + Math.random() * (M.every[1] - M.every[0]) : 5; if (M && M.event && !inBattle) M.event(this, this.ctx.currentTime + 0.02); }
+    } catch (e) { this.errors++; }
+  },
+  setMood(mood) {
+    const c = this.ctx, t = c.currentTime;
+    if (this.amb) { const old = this.amb; old.gain.gain.cancelScheduledValues(t); old.gain.gain.setTargetAtTime(0.0001, t, 0.5); old.nodes.forEach(n => { try { n.stop(t + 2.5); } catch (e) { /* already stopped */ } }); }
+    this.mood = mood; this.amb = null; this.evT = 2 + Math.random() * 3;
+    const M = AMBIENCE[mood]; if (!M) return;
+    const g = c.createGain(); g.gain.value = 0.0001; g.connect(this.ambBus);
+    const amb = { gain: g, nodes: [], level: M.level, duck: 1 };
+    M.build(this, amb, t);
+    g.gain.setTargetAtTime(M.level, t, 0.8);
+    this.amb = amb;
+  },
+  wind(amb, t, freq, spread, rate, vol) {   // filtered noise with a slow sweeping filter
+    const c = this.ctx, src = c.createBufferSource(), f = c.createBiquadFilter(), g = c.createGain(), lfo = c.createOscillator(), lg = c.createGain();
+    src.buffer = this.noiseBuf; src.loop = true; f.type = 'lowpass'; f.frequency.value = freq; f.Q.value = 1.2; g.gain.value = vol;
+    lfo.frequency.value = rate; lg.gain.value = spread; lfo.connect(lg); lg.connect(f.frequency);
+    src.connect(f); f.connect(g); g.connect(amb.gain); src.start(t); lfo.start(t);
+    amb.nodes.push(src, lfo);
+  },
+  drone(amb, t, freqs, type, vol, cutoff) {
+    const c = this.ctx, f = c.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = cutoff || 400; f.connect(amb.gain);
+    freqs.forEach((fr, i) => {
+      const o = c.createOscillator(), g = c.createGain(); o.type = type; o.frequency.value = fr; o.detune.value = (i % 2 ? 6 : -6);
+      g.gain.value = vol; o.connect(g); g.connect(f); o.start(t); amb.nodes.push(o);
+    });
+  },
+};
+const AMBIENCE = {
+  title:   { level: 0.5, every: [5, 9], build(S, a, t) { S.drone(a, t, [65.4, 98, 130.8], 'sine', 0.02, 500); S.wind(a, t, 420, 200, 0.07, 0.025); },
+             event(S, t) { S.arp(t, [784, 988, 1175], 0.22, { type: 'sine', vol: 0.02, dur: 0.9, bus: S.amb.gain }); } },
+  village: { level: 0.5, every: [2, 5], build(S, a, t) { S.wind(a, t, 600, 250, 0.06, 0.03); },
+             event(S, t) { for (let i = 0; i < 3; i++) S.tone(t + i * 0.07, 4200 + Math.random() * 300, 0.035, { type: 'sine', vol: 0.012, bus: S.amb.gain }); } },
+  forest:  { level: 0.55, every: [7, 14], build(S, a, t) { S.wind(a, t, 480, 300, 0.05, 0.045); S.drone(a, t, [55, 82.4], 'sine', 0.012, 300); },
+             event(S, t) {   // a distant owl: hoo... hoo-hoo
+               [0, 0.5, 0.72].forEach(d => S.tone(t + d, 410, 0.32, { type: 'sine', to: 360, vol: 0.03, attack: 0.05, bus: S.amb.gain })); } },
+  barrow:  { level: 0.6, every: [3, 7], build(S, a, t) { S.drone(a, t, [41.2, 61.7, 82.4], 'sawtooth', 0.02, 180); S.wind(a, t, 300, 120, 0.04, 0.03); },
+             event(S, t) { S.tone(t, 1300 + Math.random() * 400, 0.12, { type: 'sine', to: 700, vol: 0.03, bus: S.amb.gain }); } },
+  indoor:  { level: 0.45, every: [0.15, 0.7], build(S, a, t) { S.drone(a, t, [110, 165], 'sine', 0.006, 300); },
+             event(S, t) { S.noise(t, 0.03 + Math.random() * 0.04, { filter: 'bandpass', freq: 1800 + Math.random() * 2500, q: 2, vol: 0.02, bus: S.amb.gain }); } },
+  manor:   { level: 0.55, every: [4, 9], build(S, a, t) { S.drone(a, t, [73.4, 110, 138.6], 'triangle', 0.014, 600); },
+             event(S, t) { S.tone(t, 180, 0.9, { type: 'sine', to: 150, vol: 0.02, attack: 0.3, bus: S.amb.gain }); } },
+};
+// Effects: fn(Sound, startTime)
+const SFX = {
+  step:    (S, t) => { if (t - S.lastStep < 0.12) return; S.lastStep = t; S.noise(t, 0.045, { freq: 700, vol: 0.035 }); },
+  grass:   (S, t) => S.noise(t, 0.09, { filter: 'bandpass', freq: 2600, q: 1.4, vol: 0.05 }),
+  bump:    (S, t) => { if (t - S.lastBump < 0.25) return; S.lastBump = t; S.tone(t, 110, 0.08, { to: 70, vol: 0.09 }); },
+  cursor:  (S, t) => S.tone(t, 880, 0.035, { vol: 0.045 }),
+  select:  (S, t) => { S.tone(t, 660, 0.04, { vol: 0.05 }); S.tone(t + 0.045, 990, 0.06, { vol: 0.05 }); },
+  back:    (S, t) => S.tone(t, 520, 0.07, { to: 330, vol: 0.045 }),
+  text:    (S, t) => S.tone(t, 1250, 0.02, { vol: 0.025 }),
+  open:    (S, t) => S.tone(t, 440, 0.09, { type: 'triangle', to: 700, vol: 0.07 }),
+  door:    (S, t) => { S.noise(t, 0.22, { freq: 450, vol: 0.08, attack: 0.03 }); S.tone(t, 160, 0.18, { type: 'triangle', to: 120, vol: 0.05 }); },
+  hit:     (S, t) => { S.noise(t, 0.13, { freq: 1600, to: 300, vol: 0.2 }); S.tone(t, 190, 0.1, { to: 60, vol: 0.1 }); },
+  hitSuper:(S, t) => { S.noise(t, 0.2, { freq: 3000, to: 250, vol: 0.28 }); S.tone(t, 320, 0.16, { type: 'sawtooth', to: 70, vol: 0.12 }); S.arp(t + 0.12, [880, 1320], 0.06, { vol: 0.06 }); },
+  hitWeak: (S, t) => S.noise(t, 0.09, { freq: 700, vol: 0.1 }),
+  faint:   (S, t) => S.tone(t, 440, 0.7, { to: 55, vol: 0.1 }),
+  throw:   (S, t) => S.tone(t, 300, 0.28, { type: 'triangle', to: 900, vol: 0.07 }),
+  wobble:  (S, t) => { S.tone(t, 240, 0.06, { type: 'triangle', vol: 0.09 }); S.tone(t + 0.09, 190, 0.06, { type: 'triangle', vol: 0.08 }); },
+  catch:   (S, t) => { S.tone(t, 1600, 0.04, { vol: 0.06 }); S.arp(t + 0.08, [523, 659, 784, 1047], 0.08, { vol: 0.07 }); },
+  breakout:(S, t) => { S.noise(t, 0.16, { filter: 'highpass', freq: 1500, vol: 0.12 }); S.tone(t, 600, 0.2, { to: 200, vol: 0.07 }); },
+  levelUp: (S, t) => { S.arp(t, [392, 523, 659, 784], 0.07, { vol: 0.06 }); S.tone(t + 0.3, 1047, 0.35, { type: 'triangle', vol: 0.08 }); },
+  quest:   (S, t) => S.arp(t, [784, 988, 1175, 1568], 0.09, { type: 'triangle', vol: 0.08, dur: 0.3 }),
+  item:    (S, t) => S.arp(t, [659, 880], 0.08, { type: 'triangle', vol: 0.07, dur: 0.2 }),
+  spot:    (S, t) => { S.tone(t, 1047, 0.08, { vol: 0.08 }); S.tone(t + 0.09, 1568, 0.16, { vol: 0.08 }); },
+  battleStart:   (S, t) => { S.tone(t, 880, 0.4, { to: 220, vol: 0.07 }); S.noise(t + 0.3, 0.3, { freq: 900, vol: 0.06 }); },
+  trainerBattle: (S, t) => { S.arp(t, [440, 440, 523, 659], 0.09, { vol: 0.07 }); S.tone(t + 0.4, 330, 0.35, { type: 'sawtooth', to: 165, vol: 0.06 }); },
+  win:     (S, t) => { S.arp(t, [523, 659, 784], 0.1, { vol: 0.07 }); S.tone(t + 0.32, 1047, 0.4, { type: 'triangle', vol: 0.08 }); },
+  heal:    (S, t) => S.arp(t, [523, 659, 784, 1047, 1319], 0.1, { type: 'sine', vol: 0.08, dur: 0.35 }),
+  save:    (S, t) => S.arp(t, [440, 554, 659, 880], 0.08, { type: 'sine', vol: 0.08, dur: 0.25 }),
+  run:     (S, t) => S.noise(t, 0.3, { freq: 400, to: 3000, vol: 0.07 }),
+  statUp:  (S, t) => S.tone(t, 300, 0.3, { type: 'triangle', to: 900, vol: 0.06 }),
+  statDown:(S, t) => S.tone(t, 900, 0.3, { type: 'triangle', to: 250, vol: 0.06 }),
+  victory: (S, t) => { S.arp(t, [392, 523, 659, 784, 659, 784], 0.14, { type: 'triangle', vol: 0.08, dur: 0.3 }); S.tone(t + 0.9, 1047, 1.2, { type: 'triangle', vol: 0.09 }); S.tone(t + 0.9, 523, 1.2, { type: 'sine', vol: 0.06 }); },
+  error:   (S, t) => S.tone(t, 150, 0.2, { vol: 0.07 }),
+};
+// Menu blips: decided from the key and the scene that receives it (called by Game.press before dispatch).
+function soundForKey(k, scene) {
+  if (!scene) return;
+  const name = scene.constructor.name;
+  if (name === 'OverworldScene') { if (k === 'start') Sound.play('open'); return; }
+  if (name === 'FadeScene' || name === 'EncounterFlashScene' || name === 'TrainerSpotScene') return;
+  if (name === 'DialogScene') { if (k === 'a' || k === 'b') Sound.play('text'); return; }
+  if (name === 'BattleScene') {
+    if (scene.mode === 'queue') { if ((k === 'a' || k === 'b' || k === 'start') && scene.cur && scene.cur.msg !== undefined) Sound.play('text'); return; }
+    if (scene.mode === 'done') return;
+  }
+  if (name === 'VictoryScene' && scene.t < 2.5) return;
+  if (DIRS[k]) Sound.play('cursor');
+  else if (k === 'a' || k === 'start') Sound.play('select');
+  else if (k === 'b') Sound.play('back');
+}
+
+// ===================== ROUTE TRAINERS (stage 5) =====================
+// Forager Pip and Gravedigger Ott watch the Whisperwood Trail. Each NPC def has `sight` (tiles it can see ahead,
+// blocked by solid tiles and other NPCs) and optionally `turns` (directions it looks around in).
+// If you step into view while you have a creature that can battle: "!", the trainer walks up, talks, battles.
+// Defeated trainers are stored in state.defeatedTrainers (saved) and never challenge again.
+// Their side quests (SQ5 Glowcap Soup, SQ6 Something With Antlers) start when you talk to them after beating them.
+const TRAINER_TALK = {
+  forager_pip: {
+    intro: ["Hey! You with the creature! Every forager tests new sprouts. That's the rule!", "Show me what you've picked up. Battle!"],
+    lose: "Squished like a glowcap! You're really good.",
+    noParty: "You've no creature ready to battle? Come back when you do. I'll be foraging.",
+  },
+  gravedigger_ott: {
+    intro: ["Hold it. Nobody walks past my grass without a proper howdy-do.", "Creatures out, lantern-bearer. Let's see what you've got."],
+    lose: "Well, dig me a hole. You're the real thing.",
+    noParty: "No creature fit to battle? Rest up at a Lantern House, then come see old Ott.",
+  },
+};
+function trainerDefeated(G, id) { return !!(G.state && G.state.defeatedTrainers && G.state.defeatedTrainers[id]); }
+function partyAble(G) { return !!(G.state && G.state.party.some(c => c.hp > 0)); }
+const Trainers = {
+  enabled: true,   // tests can switch line-of-sight off (GAME.setTrainerSight)
+  // Undefeated route trainers standing on the current map (the boss never uses line of sight).
+  watchers(G = Game) { return G.npcs.filter(n => n.def.trainer && n.def.sight && TRAINERS[n.def.trainer] && !TRAINERS[n.def.trainer].boss && !trainerDefeated(G, n.def.trainer)); },
+  // Distance (1..sight) if the trainer can see the player right now, else 0.
+  lineOfSight(n, p = Game.player) {
+    if (!p || n.moving) return 0;
+    const [dx, dy] = DIRS[n.dir];
+    for (let i = 1; i <= (n.def.sight || 0); i++) {
+      const x = n.x + dx * i, y = n.y + dy * i;
+      if (x === p.x && y === p.y) return i;
+      if (TILE_INFO[tileAt(Game.map, x, y)].solid || Game.npcs.some(o => o !== n && o.x === x && o.y === y)) return 0;
+    }
+    return 0;
+  },
+  // Called after each completed step (and when a trainer turns). Returns true if a trainer spotted the player.
+  check(G = Game) {
+    if (!this.enabled || !G.state || !G.player || G.player.moving || G.top() !== G.overworld || !partyAble(G)) return false;
+    for (const n of this.watchers(G)) {
+      const d = this.lineOfSight(n);
+      if (d) { this.spot(G, n, d); return true; }
+    }
+    return false;
+  },
+  // Trainers with `turns` look around every couple of seconds (and may spot you while you stand still).
+  update(dt) {
+    if (Game.freezeNPCs) return false;
+    for (const n of this.watchers(Game)) {
+      const turns = n.def.turns; if (!turns || n.moving) continue;
+      if (n.turnT === undefined) n.turnT = 2 + hash2(n.x, n.y, 21) * 1.5;
+      n.turnT -= dt;
+      if (n.turnT > 0) continue;
+      n.turnT = 2.2 + Math.random() * 1.6;
+      n.dir = turns[(turns.indexOf(n.dir) + 1) % turns.length];
+      if (this.check(Game)) return true;
+    }
+    return false;
+  },
+  spot(G, npc, dist) {
+    G.lastSpot = { trainer: npc.def.trainer, npc: npc.def.id, dist, from: { x: npc.x, y: npc.y }, player: { x: G.player.x, y: G.player.y } };
+    G.spotCount = (G.spotCount || 0) + 1;
+    G.pushScene(new TrainerSpotScene(npc, dist));
+  },
+  // Start the battle (from the trainer's challenge dialogue). After a win, the trainer talks again (quest offer).
+  fight(G, npc) {
+    const id = npc.def.trainer;
+    if (!partyAble(G)) return G.say([TRAINER_TALK[id].noParty], { speaker: npc.def.name });
+    G.hooks.startTrainerBattle(id, npc, (result) => {
+      if (result !== 'win') return;
+      G.whenIdle(() => { const live = G.npcs.find(n => n.def.id === npc.def.id); if (live) G.talkTo(live); });
+    });
+  },
+};
+
+// "!" over the trainer, then it walks up to you; ends by starting its dialogue (which starts the battle).
+class TrainerSpotScene {
+  constructor(npc, dist) {
+    this.opaque = false; this.npc = npc; this.steps = Math.max(0, dist - 1); this.t = 0; this.phase = 'alert';
+    Sound.play('spot');
+  }
+  update(dt) {
+    const n = this.npc;
+    this.t += dt;
+    if (this.phase === 'alert') { if (this.t >= 0.8) this.phase = 'walk'; return; }
+    if (n.moving) {
+      n.moveT += dt / (WALK_TIME * 1.25);
+      if (n.moveT >= 1) { n.moving = false; n.x = n.tx; n.y = n.ty; n.moveT = 0; n.stepParity ^= 1; this.steps--; }
+      return;
+    }
+    if (this.steps > 0) {
+      const [dx, dy] = DIRS[n.dir];
+      n.tx = n.x + dx; n.ty = n.y + dy; n.moving = true; n.moveT = 0;
+      return;
+    }
+    const opposite = { up: 'down', down: 'up', left: 'right', right: 'left' };
+    Game.player.dir = opposite[n.dir];
+    Game.popScene(this);
+    Game.talkTo(n);   // the challenge rule below -> battle
+  }
+  onPress() {}
+  draw(g) {
+    const cam = Game.camera, { px, py } = entityPixelPos(this.npc);   // the "!" stays over the trainer while it walks up
+    const pop = Math.min(1, this.t / 0.12);
+    const x = clamp((px - cam.x + 4) * SCALE, 8, 640 - 44), y = Math.max(8, (py - cam.y - 13) * SCALE + Math.round((1 - pop) * 12));
+    // pixel speech bubble: 8x10 low-res pixels with a tail
+    g.fillStyle = PAL.outline; g.fillRect(x - 4, y - 4, 40, 44); g.fillRect(x + 8, y + 40, 12, 8);
+    g.fillStyle = '#f2ecff'; g.fillRect(x, y, 32, 36); g.fillRect(x + 12, y + 36, 4, 6);
+    g.fillStyle = '#d0203a'; g.fillRect(x + 12, y + 4, 8, 18); g.fillRect(x + 12, y + 26, 8, 6);
+  }
+}
+
+// Trainer dialogue comes before the NPCs' story rules: an undefeated trainer challenges you.
+for (const [npcId, tid] of [['pip', 'forager_pip'], ['ott', 'gravedigger_ott']]) {
+  DIALOGUE[npcId].unshift(
+    { when: (G) => !trainerDefeated(G, tid) && partyAble(G), lines: TRAINER_TALK[tid].intro, then: (G, npc) => Trainers.fight(G, npc) },
+    { when: (G) => !trainerDefeated(G, tid), lines: (G, base) => base.concat([TRAINER_TALK[tid].noParty]) });
+}
+// SQ5 / SQ6 open once you've beaten the trainer (STORY.md 3: "Talk to Pip/Ott after beating him").
+QUESTS.sq_glowcap_soup.start.when = (G) => trainerDefeated(G, 'forager_pip');
+QUESTS.sq_pact_stones.start.when = (G) => trainerDefeated(G, 'gravedigger_ott');
+
+// ===================== SAVE PROMPT + VICTORY / CREDITS (stage 5) =====================
+// ---------------- Pause -> SAVE ----------------
+// Asks first; warns when the slot holds a different journey (e.g. after NEW GAME). Writes through SaveSystem (SafeStorage).
+class SaveScene {
+  constructor(opts = {}) {
+    this.opaque = false; this.yes = 0; this.opts = opts;
+    this.old = SaveSystem.info();
+    this.overwrite = !!(this.old && Game.state && this.old.runId !== (Game.state.runId || 'legacy'));
+  }
+  update() {}
+  onPress(k) {
+    if (k === 'up' || k === 'down' || k === 'left' || k === 'right') this.yes ^= 1;
+    else if (k === 'b' || ((k === 'a' || k === 'start') && this.yes === 1)) { Game.popScene(this); if (this.opts.onClose) this.opts.onClose(false); }
+    else if (k === 'a' || k === 'start') this.doSave();
+  }
+  doSave() {
+    Game.popScene(this);
+    const ok = SaveSystem.save();
+    Game.lastSave = { ok, at: Date.now() };
+    Sound.play(ok ? 'save' : 'error');
+    Game.say(ok ? ['Your journey has been saved!', '(Choose CONTINUE on the title screen to pick up right here.)']
+                : ['The journal pages won\'t stick... Saving failed.', '(This browser is blocking storage. Private mode, maybe?)'],
+      { onClose: () => { if (this.opts.onClose) this.opts.onClose(ok); } });
+  }
+  draw(g) {
+    const st = Game.state, z = Game.map.id === 'overworld' ? zoneAt(Game.map, Game.player.x, Game.player.y) : null;
+    drawBox(g, 48, 120, 544, this.overwrite ? 300 : 270);
+    menuTitle(g, 'SAVE YOUR JOURNEY?', 80, 170);
+    g.font = MFONT_S; g.fillStyle = PAL.text;
+    const lead = st.party[0];
+    const rows = [`${z ? z.name : Game.map.title}   \u00b7   ${fmtTime(st.playTime)}`,
+      lead ? `${SPECIES[lead.species].name} Lv${lead.level}${st.party.length > 1 ? ` and ${st.party.length - 1} more` : ''}` : 'No creatures yet',
+      `Creatures caught ${Object.keys(st.caught).length}   \u00b7   Lore pages ${Story.loreCount()}/${LORE_IDS.length}`];
+    rows.forEach((t, i) => g.fillText(t, 80, 212 + i * 30));
+    let y = 312;
+    if (this.overwrite) { g.fillStyle = '#ff8a6a'; g.fillText('This replaces your OTHER saved journey!', 80, y); y += 36; }
+    ['YES', 'NO'].forEach((t, i) => {
+      const x = 180 + i * 180, sel = i === this.yes;
+      g.font = FONT; g.fillStyle = sel ? PAL.flame2 : PAL.text; g.fillText(t, x, y + 40); if (sel) cursorAt(g, x - 30, y + 40);
+    });
+  }
+}
+
+// ---------------- the ending ----------------
+// The main story ends when MQ6 "The Last Watch Ends" completes (you woke Ossuarch, the Keeper of Endings).
+// Victory / credits screen -> back to the world (free play: side quests, the Creature Log, lore) -> offer to save.
+const Ending = {
+  shown: false,
+  stats() {
+    const st = Game.state;
+    const side = QUEST_IDS.filter(id => QUESTS[id].kind === 'side');
+    return {
+      party: st.party.map(c => ({ species: c.species, level: c.level })),
+      playTime: st.playTime, caught: Object.keys(st.caught).length, species: Object.keys(SPECIES).length,
+      lore: Story.loreCount(), loreTotal: LORE_IDS.length,
+      questsDone: QUEST_IDS.filter(id => Quests.isDone(id)).length, questsTotal: QUEST_IDS.length,
+      sideLeft: side.filter(id => !Quests.isDone(id)).length,
+    };
+  },
+  show() {
+    const st = Game.state;
+    if (!st.flags.gameCleared) { st.flags.gameCleared = true; st.clearTime = Math.floor(st.playTime); }
+    Game.victoryCount = (Game.victoryCount || 0) + 1;
+    const fade = new FadeScene(() => {   // slip the victory screen in under the fade so it fades in
+      const i = Game.scenes.indexOf(fade);
+      Game.scenes.splice(i < 0 ? Game.scenes.length : i, 0, new VictoryScene(Ending.stats()));
+    }, 1.2);
+    Game.pushScene(fade);
+  },
+  afterVictory() {
+    const s = Ending.stats();
+    const lines = ['Caw! So that\'s the end of the story... for now.',
+      s.sideLeft ? `Folks still need help: ${s.sideLeft} side quest${s.sideLeft > 1 ? 's' : ''} left. Check the JOURNAL.` : 'Every side quest done, too. Show-off.',
+      `Creature Log: ${s.caught} of ${s.species}. Lore pages: ${s.lore} of ${s.loreTotal}. The forest's still full of lost things.`];
+    Game.say(lines, { speaker: Game.state.flags.nibJoined ? 'Nib' : null, onClose: () => Game.pushScene(new SaveScene()) });
+  },
+};
+class VictoryScene {
+  constructor(stats) { this.opaque = true; this.t = 0; this.stats = stats; this.closing = false; Sound.play('victory'); }
+  update(dt) { this.t += dt; }
+  get ready() { return this.t >= 2.5; }
+  onPress(k) {
+    if (!this.ready || this.closing || !(k === 'a' || k === 'b' || k === 'start')) return;
+    this.closing = true;
+    Game.pushScene(new FadeScene(() => { Game.popScene(this); Game.whenIdle(() => Ending.afterVictory()); }, 1.0));
+  }
+  draw(g) {
+    const t = this.t, s = this.stats;
+    g.fillStyle = '#07050f'; g.fillRect(0, 0, 640, 576);
+    for (let i = 0; i < 60; i++) {   // stars + rising wisps
+      const x = (hash2(i, 11) * 640 + Math.sin(t * 0.5 + i) * 20 + 640) % 640;
+      const y = (hash2(i, 12) * 576 - t * (6 + i % 9) * 2 + 57600) % 576;
+      g.fillStyle = `rgba(${i % 4 ? '182,255,106' : '255,212,107'},${(0.25 + 0.3 * Math.sin(t * 2 + i)).toFixed(2)})`; g.fillRect(Math.round(x), Math.round(y), 4, 4);
+    }
+    const fade = (t0) => clamp((t - t0) / 0.6, 0, 1);
+    g.textAlign = 'center';
+    g.globalAlpha = fade(0.1);
+    g.font = 'bold 64px "DejaVu Sans Mono", monospace';
+    g.fillStyle = '#2a1a4a'; g.fillText(GAME_TITLE, 324, 96); g.fillStyle = '#d8c8ff'; g.fillText(GAME_TITLE, 320, 90);
+    g.font = FONT; g.fillStyle = PAL.textDim; g.fillText('Lanterns & Lost Things', 320, 126);
+    g.globalAlpha = fade(0.6);
+    g.fillStyle = PAL.flame; g.fillText('The lanterns are loved again.', 320, 170);
+    g.fillStyle = PAL.text; g.font = MFONT_S; g.fillText('The Keeper is awake. The forest dreams again.', 320, 198);
+    // the party parades along
+    g.globalAlpha = fade(1.0);
+    const n = s.party.length, w = 96;
+    s.party.forEach((c, i) => {
+      const x = 320 - (n * w) / 2 + i * w + 16, bob = Math.round(Math.sin(t * 4 + i) * 4);
+      g.imageSmoothingEnabled = false; g.drawImage(CREATURE_SPRITES[c.species], x, 222 + bob, 64, 64);
+      g.font = MFONT_XS; g.fillStyle = PAL.text; g.fillText(`${SPECIES[c.species].name}`, x + 32, 306);
+      g.fillStyle = TYPES[SPECIES[c.species].type].color; g.fillText(`Lv${c.level}`, x + 32, 324);
+    });
+    g.globalAlpha = fade(1.5);
+    drawBox(g, 120, 340, 400, 128);
+    g.font = MFONT_S; g.fillStyle = PAL.text; g.textAlign = 'left';
+    [['Play time', fmtTime(s.playTime)], ['Creatures caught', `${s.caught} / ${s.species}`], ['Lore pages', `${s.lore} / ${s.loreTotal}`], ['Quests done', `${s.questsDone} / ${s.questsTotal}`]]
+      .forEach(([a, b], i) => { g.fillStyle = PAL.textDim; g.fillText(a, 150, 376 + i * 24); g.fillStyle = PAL.text; g.textAlign = 'right'; g.fillText(b, 490, 376 + i * 24); g.textAlign = 'left'; });
+    g.textAlign = 'center';
+    g.globalAlpha = fade(2.0);
+    g.font = MFONT_XS; g.fillStyle = PAL.textDim;
+    g.fillText('Starring Nib, Lady Ashgrave, Crowmalkin, Ossuarch', 320, 492);
+    g.fillText('and every lost thing in the Gloamwood', 320, 510);
+    g.font = FONT; g.fillStyle = PAL.flame2; g.fillText('Thanks for playing!', 320, 540);
+    g.globalAlpha = 1;
+    if (this.ready && Math.floor(t * 2) % 2 === 0) { g.font = MFONT_XS; g.fillStyle = PAL.text; g.fillText('SPACE: back to the Gloamwood (side quests await)', 320, 566); }
+    g.textAlign = 'left';
+  }
+}
+
+// ---------------- test / debug hooks (stage 5) ----------------
+Object.assign(window.GAME, {
+  Trainers, TRAINER_TALK, Sound, SFX_NAMES, Ending,
+  setTrainerSight(on) { Trainers.enabled = !!on; },
+  lastSpot() { return Game.lastSpot || null; },
+  spotCount() { return Game.spotCount || 0; },
+  defeatedTrainers() { return Object.assign({}, Game.state.defeatedTrainers); },
+  trainerNpcs() { return Game.npcs.filter(n => n.def.trainer).map(n => ({ id: n.def.id, trainer: n.def.trainer, x: n.x, y: n.y, dir: n.dir, sight: n.def.sight || 0 })); },
+  save() { return SaveSystem.save(); },
+  hasSave() { return SaveSystem.hasSave(); },
+  saveInfo() { return SaveSystem.info(); },
+  lastSave() { return Game.lastSave || null; },
+  showVictory() { Ending.show(); },
+  victoryCount() { return Game.victoryCount || 0; },
+  audio() {
+    const c = Sound.ctx;
+    return { available: Sound.available, started: Sound.started, state: c ? c.state : null, muted: Settings.muted, volume: Settings.volume,
+      ambient: Settings.ambient, mood: Sound.mood, requested: Sound.requested, played: Sound.played, last: Sound.last, errors: Sound.errors };
+  },
+  playSfx(name) { return Sound.play(name); },
+  settings() { return { brightness: Settings.brightnessName(), volume: Settings.volume, muted: Settings.muted, ambient: Settings.ambient }; },
 });
 
 // ===================== START =====================
